@@ -12,11 +12,13 @@ class SearchItem
         public readonly ?string $lastModificationDate,
         /** @var array<string, mixed> Search parameters that matched (e.g. 'path' => 'foo', 'tags' => ['tag1']) */
         public readonly array $matchedParameters,
+        /** @var array<string, mixed> All frontmatter properties from the note */
+        public readonly array $frontmatter = [],
     ) {}
 
-    public function toArray(): array
+    public function toArray(bool $includeFrontmatter = false): array
     {
-        return [
+        $result = [
             'index' => $this->index,
             'fullPath' => $this->fullPath,
             'relativePath' => $this->relativePath,
@@ -24,5 +26,11 @@ class SearchItem
             'lastModificationDate' => $this->lastModificationDate,
             'matchedParameters' => $this->matchedParameters,
         ];
+
+        if ($includeFrontmatter) {
+            $result['frontmatter'] = $this->frontmatter;
+        }
+
+        return $result;
     }
 }

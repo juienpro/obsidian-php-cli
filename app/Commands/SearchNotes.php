@@ -14,9 +14,13 @@ class SearchNotes extends Command
         {--operator=AND : Combine criteria with AND or OR}
         {--path=* : Relative path(s) from vault root (exact or prefix)}
         {--pathContains=* : String(s) that relative path must contain (case insensitive)}
+        {--withoutPathContains=* : Exclude notes whose relative path contains any of these strings (case insensitive)}
         {--tag=* : Frontmatter tag(s) (note must have at least one)}
         {--property=* : Frontmatter property name(s) that must exist}
         {--propertyValue=* : property_name,property_value pairs}
+        {--withoutTag=* : Exclude notes that have any of these frontmatter tags}
+        {--withoutProperty=* : Exclude notes that have any of these frontmatter property names}
+        {--withoutPropertyValue=* : Exclude notes with these property_name,property_value pairs}
         {--title=* : Title(s) to match (frontmatter title or first heading)}
         {--content=* : Content substring(s) to match in body}
         {--modifiedBefore= : Filter by last modification date before (format: YYYY-MM-DD)}
@@ -69,7 +73,7 @@ class SearchNotes extends Command
             ]);
 
             if ($matched !== null) {
-                $results[] = new SearchItem($index++, $fullPath, $relativePath, $title, $lastModificationDate, $matched);
+                $results[] = new SearchItem($index++, $fullPath, $relativePath, $title, $lastModificationDate, $matched, $frontmatter);
             }
         }
 
@@ -87,7 +91,7 @@ class SearchNotes extends Command
 
         // Output results
         if ($this->option('j')) {
-            $this->line(json_encode(array_map(static fn(SearchItem $s) => $s->toArray(), $results), JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT));
+            $this->line(json_encode(array_map(static fn(SearchItem $s) => $s->toArray(true), $results), JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT));
         } else {
             $this->displayTable($results, $noteService);
         }
@@ -108,6 +112,9 @@ class SearchNotes extends Command
             'property' => 'properties',
             'title' => 'title',
             'content' => 'content',
+            'withoutTag' => 'withoutTags',
+            'withoutProperty' => 'withoutProperties',
+            'withoutPathContains' => 'withoutPathContains',
         ];
         foreach ($optionToKey as $option => $key) {
             $values = $this->option($option);
@@ -126,6 +133,18 @@ class SearchNotes extends Command
         }
         if (isset($criteria['propertyValue'])) {
             $criteria['propertyValue'] = array_values($criteria['propertyValue']);
+        }
+        $wpv = $this->option('withoutPropertyValue');
+        if (is_array($wpv) && $wpv !== []) {
+            foreach ($wpv as $raw) {
+                $parts = explode(',', (string) $raw, 2);
+                if (count($parts) === 2) {
+                    $criteria['withoutPropertyValue'][] = ['name' => trim($parts[0]), 'value' => trim($parts[1])];
+                }
+            }
+        }
+        if (isset($criteria['withoutPropertyValue'])) {
+            $criteria['withoutPropertyValue'] = array_values($criteria['withoutPropertyValue']);
         }
         return $criteria;
     }
@@ -159,11 +178,11 @@ class SearchNotes extends Command
             $key = null;
             $block = '';
             foreach ($lines as $line) {
-                if (preg_match('/^([a-zA-Z0-9_-]+)\s*:\s*(.*)$/', $line, $mm)) {
+                if (preg_match('/^([a-zA-Z0-9_\-\s]+?)\s*:\s*(.*)$/', $line, $mm)) {
                     if ($key !== null) {
                         $frontmatter[$key] = $this->parseFrontmatterValue($block);
                     }
-                    $key = $mm[1];
+                    $key = trim($mm[1]);
                     $block = trim($mm[2]);
                 } elseif ($key !== null && (str_starts_with($line, ' ') || str_starts_with($line, "\t"))) {
                     $block .= "\n" . $line;
@@ -266,11 +285,31 @@ class SearchNotes extends Command
             $matched['content'] = $contentMatch;
         }
 
+        // Exclusions: note must NOT have any of these
+        if ($this->matchPathContains($criteria['withoutPathContains'] ?? [], $ctx['relativePath']) !== null) {
+            return null;
+        }
+        if ($this->noteHasAnyOfTheseTags($criteria['withoutTags'] ?? [], $ctx['frontmatter'])) {
+            return null;
+        }
+        if ($this->noteHasAnyOfTheseProperties($criteria['withoutProperties'] ?? [], $ctx['frontmatter'])) {
+            return null;
+        }
+        if ($this->noteHasAnyOfThesePropertyValues($criteria['withoutPropertyValue'] ?? [], $ctx['frontmatter'])) {
+            return null;
+        }
+
+        $exclusionKeys = ['withoutPathContains', 'withoutTags', 'withoutProperties', 'withoutPropertyValue'];
+        $positiveKeys = array_diff(array_keys($criteria), $exclusionKeys);
+        if ($positiveKeys === [] && $criteria !== []) {
+            return ['path' => $ctx['relativePath']];
+        }
+
         if ($operator === 'OR') {
             return $matched !== [] ? $matched : null;
         }
 
-        $required = array_keys($criteria);
+        $required = $positiveKeys;
         foreach ($required as $key) {
             if ($key === 'propertyValue') {
                 if (empty($matched['propertyValue'])) {
@@ -388,12 +427,49 @@ class SearchNotes extends Command
                     $found[] = $name . '=' . $want;
                 }
             } else {
-                if ((string) $actual === $want) {
+                $normalized = is_bool($actual) ? ($actual ? 'true' : 'false') : (string) $actual;
+                if ($normalized === $want) {
                     $found[] = $name . '=' . $want;
                 }
             }
         }
         return $found === [] ? null : $found;
+    }
+
+    /**
+     * @param list<string> $values
+     * @param array<string, mixed> $frontmatter
+     */
+    private function noteHasAnyOfTheseTags(array $values, array $frontmatter): bool
+    {
+        if ($values === []) {
+            return false;
+        }
+        return $this->matchTags($values, $frontmatter) !== null;
+    }
+
+    /**
+     * @param list<string> $names
+     * @param array<string, mixed> $frontmatter
+     */
+    private function noteHasAnyOfTheseProperties(array $names, array $frontmatter): bool
+    {
+        if ($names === []) {
+            return false;
+        }
+        return $this->matchProperties($names, $frontmatter) !== null;
+    }
+
+    /**
+     * @param list<array{name: string, value: string}> $pairs
+     * @param array<string, mixed> $frontmatter
+     */
+    private function noteHasAnyOfThesePropertyValues(array $pairs, array $frontmatter): bool
+    {
+        if ($pairs === []) {
+            return false;
+        }
+        return $this->matchPropertyValue($pairs, $frontmatter) !== null;
     }
 
     /**
